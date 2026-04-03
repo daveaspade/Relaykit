@@ -1,0 +1,69 @@
+Metadata-Version: 2.4
+Name: relaykit
+Version: 0.1.0
+Summary: Local OpenAI-compatible gateway that routes to OAuth CLI providers
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: fastapi>=0.110.0
+Requires-Dist: uvicorn>=0.27.0
+Requires-Dist: pydantic>=2.6.0
+Dynamic: license-file
+
+# RelayKit
+
+RelayKit is a local OpenAI-compatible gateway that routes requests to OAuth-authenticated CLI providers (OpenCode, Claude, Gemini, Codex, Ollama, and more) and exposes a single base URL for any app that supports OpenAI-compatible endpoints.
+
+## Quick start (macOS/Linux)
+
+```bash
+cd /path/to/RelayKit
+./scripts/install.sh
+./scripts/run.sh
+```
+
+Open the local UI at:
+- http://127.0.0.1:11435/ui
+
+OpenAI-compatible base URL:
+- http://127.0.0.1:11435/v1
+
+If your app runs inside Docker, use:
+- http://host.docker.internal:11435/v1
+
+## What works today
+
+- OpenAI-compatible `/v1/models`
+- OpenAI-compatible `/v1/chat/completions`
+- Streaming responses
+- Auto-detect OpenCode CLI and list models
+- Route by model prefix:
+  - `claude:...` -> Anthropic via OpenCode
+  - `gemini:...` -> Google via OpenCode
+  - `codex:...` or `openai:...` -> OpenAI via OpenCode
+  - `ollama:...` -> Ollama via OpenCode (if configured)
+
+## Provider detection
+
+RelayKit detects installed CLIs and lists them in the UI. Today, OpenCode is used as the primary backend because it already supports OAuth across multiple providers.
+
+If you want to force a specific backend later, set:
+
+```bash
+export CLIBRIDGE_BACKEND=opencode
+```
+
+## Desktop UI (Tauri)
+
+A minimal desktop UI is included in `apps/desktop`.
+
+```bash
+cd apps/desktop
+npm install
+npm run tauri dev
+```
+
+## License
+
+MIT
