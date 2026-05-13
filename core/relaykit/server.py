@@ -19,6 +19,7 @@ from relaykit.providers.openai_compat import detect_local_endpoints, probe_endpo
 from relaykit.providers.claude_cli import ClaudeCLIBackend
 from relaykit.providers.gemini_cli import GeminiCLIBackend
 from relaykit.providers.codex_cli import CodexCLIBackend
+from relaykit.providers.openclaw_cli import OpenClawCLIBackend
 from relaykit.providers.hermes_cli import HermesCLIBackend
 from relaykit.config_store import load_config, save_config, create_key, verify_key, list_keys
 
@@ -28,6 +29,7 @@ backend = OpenCodeBackend()
 claude_cli = ClaudeCLIBackend()
 gemini_cli = GeminiCLIBackend()
 codex_cli = CodexCLIBackend()
+openclaw_cli = OpenClawCLIBackend()
 hermes_cli = HermesCLIBackend()
 
 _MODEL_CACHE: Dict[str, Any] = {
@@ -279,9 +281,210 @@ def _retry_delay_seconds(attempt_idx: int, cfg: Dict[str, Any]) -> float:
     return _clamp(delay_ms / 1000.0, 0.05, 3.0)
 
 
+def _ollama_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    providers = cfg.setdefault("providers", {})
+    ollama_cfg = providers.setdefault("ollama", {})
+    if not isinstance(ollama_cfg, dict):
+        ollama_cfg = {}
+        providers["ollama"] = ollama_cfg
+    if "enabled" not in ollama_cfg:
+        ollama_cfg["enabled"] = True
+    if not isinstance(ollama_cfg.get("base_url"), str) or not ollama_cfg.get("base_url"):
+        ollama_cfg["base_url"] = "http://localhost:11434"
+    if not isinstance(ollama_cfg.get("default_options"), dict):
+        ollama_cfg["default_options"] = {}
+    if not isinstance(ollama_cfg.get("model_options"), dict):
+        ollama_cfg["model_options"] = {}
+    adaptive = ollama_cfg.get("adaptive")
+    if not isinstance(adaptive, dict):
+        adaptive = {}
+        ollama_cfg["adaptive"] = adaptive
+    if "enabled" not in adaptive:
+        adaptive["enabled"] = True
+    if "learn" not in adaptive:
+        adaptive["learn"] = True
+    if not isinstance(adaptive.get("context_ladder"), list):
+        adaptive["context_ladder"] = [81920, 65536, 49152, 32768, 24576, 20480, 16384, 12288, 8192, 4096]
+    if not isinstance(adaptive.get("learned_model_options"), dict):
+        adaptive["learned_model_options"] = {}
+    return ollama_cfg
+
+
+def _normalize_context_ladder(values: Any) -> List[int]:
+    if not isinstance(values, list):
+        return [81920, 65536, 49152, 32768, 24576, 20480, 16384, 12288, 8192, 4096]
+    out: List[int] = []
+    seen = set()
+    for raw in values:
+        try:
+            v = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if v < 1024:
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    if not out:
+        return [81920, 65536, 49152, 32768, 24576, 20480, 16384, 12288, 8192, 4096]
+    out.sort(reverse=True)
+    return out
+
+
+def _resource_pressure_error(err: str) -> bool:
+    msg = (err or "").lower()
+    tokens = (
+        "resource",
+        "runner has unexpectedly stopped",
+        "signal: killed",
+        "out of memory",
+        "memory",
+        "timed out",
+        "timeout",
+        "eof",
+    )
+    return any(t in msg for t in tokens)
+
+
+def _record_ollama_learned_ctx(cfg: Dict[str, Any], model_name: str, num_ctx: int, *, success: bool, error: str = "") -> None:
+    ollama_cfg = _ollama_cfg(cfg)
+    adaptive = ollama_cfg.get("adaptive", {})
+    if not isinstance(adaptive, dict) or not adaptive.get("learn", True):
+        return
+    learned = adaptive.get("learned_model_options", {})
+    if not isinstance(learned, dict):
+        learned = {}
+        adaptive["learned_model_options"] = learned
+    entry = learned.get(model_name, {})
+    if not isinstance(entry, dict):
+        entry = {}
+    changed = False
+    if success:
+        if int(entry.get("last_good_num_ctx", 0) or 0) != int(num_ctx):
+            entry["last_good_num_ctx"] = int(num_ctx)
+            changed = True
+        entry["last_good_at"] = _now_iso()
+        if entry.get("last_error"):
+            entry["last_error"] = ""
+            changed = True
+    else:
+        entry["last_error"] = (error or "")[:500]
+        entry["last_error_at"] = _now_iso()
+        prev = int(entry.get("last_failed_num_ctx", 0) or 0)
+        if prev != int(num_ctx):
+            entry["last_failed_num_ctx"] = int(num_ctx)
+            changed = True
+    if changed:
+        learned[model_name] = entry
+        save_config(cfg)
+
+
+def _ollama_ctx_attempts(cfg: Dict[str, Any], model_name: str, base_options: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ollama_cfg = _ollama_cfg(cfg)
+    adaptive = ollama_cfg.get("adaptive", {})
+    if not isinstance(adaptive, dict) or not adaptive.get("enabled", True):
+        return [dict(base_options)]
+
+    ladder = _normalize_context_ladder(adaptive.get("context_ladder"))
+    learned = adaptive.get("learned_model_options", {})
+    learned_ctx = 0
+    if isinstance(learned, dict):
+        entry = learned.get(model_name, {})
+        if isinstance(entry, dict):
+            learned_ctx = int(entry.get("last_good_num_ctx", 0) or 0)
+
+    requested_ctx = int(base_options.get("num_ctx", 0) or 0)
+    if requested_ctx > 0:
+        seed = requested_ctx
+    elif learned_ctx > 0:
+        seed = learned_ctx
+    else:
+        seed = ladder[0] if ladder else 8192
+
+    contexts: List[int] = []
+    seen = set()
+
+    def add_ctx(value: int) -> None:
+        if value <= 0 or value in seen:
+            return
+        seen.add(value)
+        contexts.append(value)
+
+    add_ctx(seed)
+    add_ctx(learned_ctx)
+    for ctx in ladder:
+        if ctx <= seed:
+            add_ctx(ctx)
+
+    attempts: List[Dict[str, Any]] = []
+    for ctx in contexts[:6]:
+        options = dict(base_options)
+        options["num_ctx"] = int(ctx)
+        attempts.append(options)
+    if not attempts:
+        attempts.append(dict(base_options))
+    return attempts
+
+
+def _run_ollama_adaptive_chat(
+    cfg: Dict[str, Any],
+    model_name: str,
+    messages: List[Dict[str, Any]],
+    *,
+    stream: bool,
+) -> Iterable[str]:
+    ollama_cfg = _ollama_cfg(cfg)
+    base_url = ollama_cfg.get("base_url", "http://localhost:11434")
+    default_options = ollama_cfg.get("default_options", {})
+    if not isinstance(default_options, dict):
+        default_options = {}
+    model_options_map = ollama_cfg.get("model_options", {})
+    if not isinstance(model_options_map, dict):
+        model_options_map = {}
+    model_options = model_options_map.get(model_name, {})
+    if not isinstance(model_options, dict):
+        model_options = {}
+
+    base_options = dict(default_options)
+    base_options.update(model_options)
+    backend_ollama = OllamaBackend(base_url=base_url, default_options={})
+    attempts = _ollama_ctx_attempts(cfg, model_name, base_options)
+
+    if stream:
+        stream_options = attempts[0] if attempts else dict(base_options)
+        return backend_ollama.chat(model_name, messages, stream=True, options=stream_options)
+    last_error = ""
+    for idx, options in enumerate(attempts):
+        num_ctx = int(options.get("num_ctx", 0) or 0)
+        try:
+            parts = list(backend_ollama.chat(model_name, messages, stream=False, options=options))
+            text = parts[0] if parts else ""
+            if text:
+                if num_ctx > 0:
+                    _record_ollama_learned_ctx(cfg, model_name, num_ctx, success=True)
+                return [text]
+            last_error = "Ollama returned empty response"
+            if num_ctx > 0:
+                _record_ollama_learned_ctx(cfg, model_name, num_ctx, success=False, error=last_error)
+            if idx == len(attempts) - 1:
+                raise RuntimeError(last_error)
+        except Exception as exc:
+            last_error = str(exc)
+            if num_ctx > 0:
+                _record_ollama_learned_ctx(cfg, model_name, num_ctx, success=False, error=last_error)
+            if idx == len(attempts) - 1:
+                raise RuntimeError(last_error)
+            if not _resource_pressure_error(last_error):
+                raise RuntimeError(last_error)
+            continue
+
+    raise RuntimeError(last_error or "Ollama adaptive routing failed")
+
+
 def _choose_probe_targets(catalog: Dict[str, Any]) -> List[str]:
     targets: Dict[str, str] = {}
-    preferred = {"hermes", "claude", "gemini", "codex", "ollama"}
+    preferred = {"hermes", "claude", "gemini", "codex", "openclaw", "ollama"}
     for item in catalog.get("models", []):
         mid = item.get("id")
         provider = item.get("provider")
@@ -313,6 +516,10 @@ def _light_probe_model(model: str, cfg: Dict[str, Any], catalog: Dict[str, Any])
     if prefix in {"codex", "openai"}:
         if not codex_cli.available:
             return False, "Codex CLI unavailable"
+        return True, ""
+    if prefix in {"openclaw", "claw"}:
+        if not openclaw_cli.available:
+            return False, "OpenClaw CLI unavailable"
         return True, ""
     if prefix == "hermes":
         if not hermes_cli.available:
@@ -364,7 +571,18 @@ def _health_probe_loop() -> None:
             routing = _routing_config(cfg)
             interval = int(routing["probe_interval_seconds"])
             _run_health_probe_cycle(cfg)
-            time.sleep(max(10, interval))
+            runtime = _routing_runtime_snapshot(limit=200)
+            open_circuits = int(runtime.get("open_circuit_count", 0) or 0)
+            unhealthy = int(runtime.get("unhealthy_count", 0) or 0)
+            probe = runtime.get("probe", {}) if isinstance(runtime.get("probe"), dict) else {}
+            cycles = int(probe.get("cycles", 0) or 0)
+            if open_circuits > 0 or unhealthy > 0:
+                sleep_for = max(10, min(30, interval // 2 if interval > 20 else interval))
+            elif cycles >= 4:
+                sleep_for = min(300, max(interval, interval * 2))
+            else:
+                sleep_for = max(10, interval)
+            time.sleep(sleep_for)
         except Exception:
             time.sleep(15)
 
@@ -517,6 +735,7 @@ def _detected_cli_snapshot() -> Dict[str, Any]:
         "claude": {"available": claude_cli.available, "models": _normalize_model_list(claude_cli.list_models())},
         "gemini": {"available": gemini_cli.available, "models": _normalize_model_list(gemini_cli.list_models())},
         "codex": {"available": codex_cli.available, "models": _normalize_model_list(codex_cli.list_models())},
+        "openclaw": {"available": openclaw_cli.available, "models": _normalize_model_list(openclaw_cli.list_models())},
         "hermes": {"available": hermes_cli.available, "models": _normalize_model_list(hermes_cli.list_models())},
         "ollama": {"available": ollama_available, "models": []},
     }
@@ -525,7 +744,7 @@ def _detected_cli_snapshot() -> Dict[str, Any]:
 def _seed_provider_models(cfg: Dict[str, Any], detected: Dict[str, Any], replace: bool = False) -> Dict[str, int]:
     providers_cfg = cfg.setdefault("providers", {})
     seeded_counts: Dict[str, int] = {}
-    for provider in ("claude", "gemini", "codex", "hermes"):
+    for provider in ("claude", "gemini", "codex", "openclaw", "hermes"):
         provider_cfg = providers_cfg.setdefault(provider, {})
         if not isinstance(provider_cfg, dict):
             provider_cfg = {}
@@ -546,6 +765,13 @@ def _seed_provider_models(cfg: Dict[str, Any], detected: Dict[str, Any], replace
         ollama_cfg["enabled"] = True
     if not isinstance(ollama_cfg.get("base_url"), str) or not ollama_cfg.get("base_url"):
         ollama_cfg["base_url"] = "http://localhost:11434"
+    if not isinstance(ollama_cfg.get("default_options"), dict):
+        ollama_cfg["default_options"] = {}
+    if not isinstance(ollama_cfg.get("model_options"), dict):
+        ollama_cfg["model_options"] = {
+            "gemma4:31b": {"num_ctx": 8192},
+            "gemma4:26b": {"num_ctx": 8192},
+        }
     return seeded_counts
 
 
@@ -604,7 +830,7 @@ def _model_stats(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
 
 def _provider_priority(provider: str) -> int:
-    order = {"hermes": 0, "claude": 1, "gemini": 2, "codex": 3, "ollama": 4, "openai": 5, "relaykit": 6, "alias": 7}
+    order = {"hermes": 0, "claude": 1, "gemini": 2, "codex": 3, "openclaw": 4, "ollama": 5, "openai": 6, "relaykit": 7, "alias": 8}
     return order.get(provider, 50)
 
 
@@ -867,6 +1093,8 @@ def _get_model_lists(cfg: Dict[str, Any], refresh: bool = False) -> List[Dict[st
         add_model(f"gemini:{model}", "gemini", "gemini", provider="gemini")
     for model in cfg_models.get("codex", {}).get("models", []):
         add_model(f"codex:{model}", "openai", "codex", provider="codex")
+    for model in cfg_models.get("openclaw", {}).get("models", []):
+        add_model(f"openclaw:{model}", "openclaw", "openclaw", provider="openclaw")
     for model in cfg_models.get("hermes", {}).get("models", []):
         add_model(f"hermes:{model}", "hermes", "hermes", provider="hermes")
 
@@ -876,6 +1104,8 @@ def _get_model_lists(cfg: Dict[str, Any], refresh: bool = False) -> List[Dict[st
         add_model(f"gemini:{model}", "gemini", "gemini", provider="gemini")
     for model in codex_cli.list_models():
         add_model(f"codex:{model}", "openai", "codex", provider="codex")
+    for model in openclaw_cli.list_models():
+        add_model(f"openclaw:{model}", "openclaw", "openclaw", provider="openclaw")
     for model in hermes_cli.list_models():
         add_model(f"hermes:{model}", "hermes", "hermes", provider="hermes")
 
@@ -886,6 +1116,7 @@ def _get_model_lists(cfg: Dict[str, Any], refresh: bool = False) -> List[Dict[st
         add_model("gemini:auto", "gemini", "gemini", provider="gemini")
     if codex_cli.available:
         add_model("codex:auto", "openai", "codex", provider="codex")
+    add_model("openclaw:auto", "openclaw", "openclaw", provider="openclaw")
     if hermes_cli.available:
         add_model("hermes:auto", "hermes", "hermes", provider="hermes")
     # Ollama local models
@@ -1050,6 +1281,8 @@ def _route_relaykit_namespace(model_name: str, catalog: Dict[str, Any]) -> tuple
         return "gemini", "auto"
     if lowered in {"codex", "openai"}:
         return "codex", "auto"
+    if lowered in {"openclaw", "claw"}:
+        return "openclaw", "auto"
     if lowered == "hermes":
         return "hermes", "auto"
     if lowered == "ollama":
@@ -1323,7 +1556,7 @@ def _failover_candidates(model: str, catalog: Dict[str, Any], cfg: Dict[str, Any
     if model_name == "auto":
         # Avoid recursive orchestration loops: when the requested auto model
         # is not Hermes, do not inject Hermes as a fallback candidate.
-        providers = ("hermes", "claude", "gemini", "codex", "ollama")
+        providers = ("hermes", "claude", "gemini", "codex", "openclaw", "ollama")
         for provider in providers:
             if provider == "hermes" and prefix != "hermes":
                 continue
@@ -1417,13 +1650,13 @@ async def _execute_chat_completion_attempt(
         if len(candidates) == 1:
             prefix = candidates[0]
     if prefix == "ollama":
-        ollama_cfg = cfg.get("providers", {}).get("ollama", {})
-        base_url = ollama_cfg.get("base_url", "http://localhost:11434")
-        ollama_backend = OllamaBackend(base_url=base_url)
         ollama_messages = _normalize_messages(messages)
         if stream:
-            return StreamingResponse(_wrap_stream(resp_model, ollama_backend.chat(model_name, ollama_messages, stream=True)), media_type="text/event-stream")
-        parts = list(ollama_backend.chat(model_name, ollama_messages, stream=False))
+            return StreamingResponse(
+                _wrap_stream(resp_model, _run_ollama_adaptive_chat(cfg, model_name, ollama_messages, stream=True)),
+                media_type="text/event-stream",
+            )
+        parts = list(_run_ollama_adaptive_chat(cfg, model_name, ollama_messages, stream=False))
         text = parts[0] if parts else ""
         return _simple_response(resp_model, text)
 
@@ -1454,6 +1687,16 @@ async def _execute_chat_completion_attempt(
         parts = list(codex_cli.chat(model_name, prompt, stream=False))
         text = parts[0] if parts else ""
         return _simple_response(resp_model, text)
+
+    if prefix in {"openclaw", "claw"} and openclaw_cli.available:
+        prompt = _messages_to_prompt(messages)
+        if stream:
+            return StreamingResponse(_wrap_stream(resp_model, openclaw_cli.chat(model_name, prompt, stream=True)), media_type="text/event-stream")
+        parts = list(openclaw_cli.chat(model_name, prompt, stream=False))
+        text = parts[0] if parts else ""
+        return _simple_response(resp_model, text)
+    if prefix in {"openclaw", "claw"} and not openclaw_cli.available:
+        raise HTTPException(status_code=503, detail="OpenClaw CLI is not installed or RELAYKIT_OPENCLAW_COMMAND is not configured")
 
     if prefix == "hermes":
         if not hermes_cli.available:
@@ -1599,6 +1842,7 @@ async def health() -> Dict[str, Any]:
         "opencode": shutil.which("opencode") is not None,
         "claude": shutil.which("claude") is not None,
         "codex": shutil.which("codex") is not None,
+        "openclaw": openclaw_cli.available,
         "gemini": shutil.which("gemini") is not None,
         "hermes": hermes_cli.available,
         "ollama": shutil.which("ollama") is not None,
@@ -1671,6 +1915,8 @@ async def chat_completions(request: Request) -> Any:
         model = "gemini:auto"
     elif model in {"codex", "openai"}:
         model = "codex:auto"
+    elif model in {"openclaw", "claw"}:
+        model = "openclaw:auto"
     elif model in {"hermes"}:
         model = "hermes:auto"
     messages = body.get("messages", [])
@@ -1737,6 +1983,8 @@ async def embeddings(request: Request) -> Any:
         model = "gemini:auto"
     elif model in {"codex", "openai"}:
         model = "codex:auto"
+    elif model in {"openclaw", "claw"}:
+        model = "openclaw:auto"
     raw_input = body.get("input", "")
     if isinstance(raw_input, list):
         inputs = [str(x) for x in raw_input]
@@ -1854,6 +2102,7 @@ async def admin_setup_state() -> Dict[str, Any]:
             "claude": _count_models("claude"),
             "gemini": _count_models("gemini"),
             "codex": _count_models("codex"),
+            "openclaw": _count_models("openclaw"),
             "hermes": _count_models("hermes"),
         },
         "catalog": {
@@ -1960,6 +2209,7 @@ async def admin_get_catalog() -> Dict[str, Any]:
             "claude": claude_cli.available,
             "gemini": gemini_cli.available,
             "codex": codex_cli.available,
+            "openclaw": openclaw_cli.available,
             "hermes": hermes_cli.available,
             "ollama": shutil.which("ollama") is not None,
         },
@@ -2014,6 +2264,7 @@ async def admin_refresh_catalog() -> Dict[str, Any]:
             "claude": claude_cli.available,
             "gemini": gemini_cli.available,
             "codex": codex_cli.available,
+            "openclaw": openclaw_cli.available,
             "hermes": hermes_cli.available,
             "ollama": shutil.which("ollama") is not None,
         },
@@ -2047,6 +2298,7 @@ async def admin_diagnostics() -> Dict[str, Any]:
             "claude": claude_cli.available,
             "gemini": gemini_cli.available,
             "codex": codex_cli.available,
+            "openclaw": openclaw_cli.available,
             "hermes": hermes_cli.available,
             "ollama": shutil.which("ollama") is not None,
         },
@@ -3553,7 +3805,7 @@ function goalModelDecision(goal, model, providerName) {
   const has = (re) => re.test(name) || re.test(id);
   if (goal === 'coding') {
     if (has(/embedding|image|audio|tts|live|native-audio|preview-tts/)) return false;
-    if (['codex', 'claude', 'gemini', 'hermes', 'ollama'].includes(provider)) return true;
+    if (['codex', 'openclaw', 'claude', 'gemini', 'hermes', 'ollama'].includes(provider)) return true;
     return null;
   }
   if (goal === 'fastest') {

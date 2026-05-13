@@ -1,6 +1,6 @@
 # RelayKit
 
-RelayKit is a local OpenAI-compatible gateway that routes requests to OAuth-authenticated CLI providers (OpenCode, Claude, Gemini, Codex, Ollama, and more) and exposes a single base URL for any app that supports OpenAI-compatible endpoints.
+RelayKit is a local OpenAI-compatible gateway that routes requests to OAuth-authenticated CLI providers (OpenCode, Claude, Gemini, Codex, OpenClaw, Ollama, and more) and exposes a single base URL for any app that supports OpenAI-compatible endpoints.
 
 ## Quick start (one-command)
 
@@ -25,7 +25,7 @@ If your app runs inside Docker, use:
 ./scripts/doctor.sh
 ```
 
-`doctor.sh` checks host tools and installed provider CLIs (OpenCode, Claude, Gemini, Codex, Hermes, Ollama).
+`doctor.sh` checks host tools and installed provider CLIs (OpenCode, Claude, Gemini, Codex, OpenClaw, Hermes, Ollama).
 
 ## Run as a background service (auto-start on boot)
 
@@ -59,9 +59,9 @@ export RELAYKIT_PORT=11436
 - Auto-detect OpenCode CLI and list models
 - Auto-detect local Ollama models (via `http://localhost:11434/api/tags`)
 - Optional: read Gemini/Claude settings if enabled
-- Native CLI adapters (no OpenCode required): Claude CLI, Gemini CLI, Codex CLI
+- Native CLI adapters (no OpenCode required): Claude CLI, Gemini CLI, Codex CLI, OpenClaw CLI
 - Hermes CLI agent adapter
-- Auto models for installed CLIs (`claude:auto`, `gemini:auto`, `codex:auto`)
+- Auto models for installed CLIs (`claude:auto`, `gemini:auto`, `codex:auto`, `openclaw:auto`)
 - Hermes model (`hermes` or `hermes:auto`) that lets Hermes choose the underlying provider/model
 - OpenAI-compatible local servers (LM Studio) via `http://localhost:1234/v1`
 - API keys (local) + audit log
@@ -72,6 +72,7 @@ export RELAYKIT_PORT=11436
   - `claude:...` -> Claude CLI (or OpenCode if available)
   - `gemini:...` -> Gemini CLI (or OpenCode if available)
   - `codex:...` -> Codex CLI (or OpenCode if available)
+  - `openclaw:...` -> OpenClaw CLI
   - `hermes:...` -> Hermes CLI agent
   - `ollama:...` -> Ollama local API
   - `lmstudio:...` -> LM Studio (OpenAI-compatible)
@@ -84,10 +85,11 @@ RelayKit detects installed CLIs and lists them in the UI. It uses multiple sourc
 - Ollama local models API
 - Optional settings file support (disabled by default):
   - `RELAYKIT_USE_SETTINGS=1`
-- Claude/Gemini/Codex CLI adapters can be forced to expose models with env vars:
+- Claude/Gemini/Codex/OpenClaw CLI adapters can be forced to expose models with env vars:
   - `RELAYKIT_CLAUDE_MODELS=claude-sonnet-4-6,claude-opus-4-6`
   - `RELAYKIT_GEMINI_MODELS=gemini-2.5-pro,gemini-2.5-flash`
   - `RELAYKIT_CODEX_MODELS=gpt-5.4,gpt-5.2`
+  - `RELAYKIT_OPENCLAW_MODELS=gpt-5.4,gemini-2.5-flash`
 - Hermes can optionally expose named models too:
   - `RELAYKIT_HERMES_MODELS=hermes:auto,hermes:custom`
 - Additional OpenAI-compatible endpoints:

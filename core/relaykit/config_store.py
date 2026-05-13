@@ -14,8 +14,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "claude": {"models": []},
         "gemini": {"models": []},
         "codex": {"models": []},
+        "openclaw": {"models": []},
         "hermes": {"models": []},
-        "ollama": {"enabled": True, "base_url": "http://localhost:11434"},
+        "ollama": {
+            "enabled": True,
+            "base_url": "http://localhost:11434",
+            "default_options": {},
+            "model_options": {
+                "gemma4:31b": {"num_ctx": 8192},
+                "gemma4:26b": {"num_ctx": 8192},
+            },
+            "adaptive": {
+                "enabled": True,
+                "learn": True,
+                "context_ladder": [81920, 65536, 49152, 32768, 24576, 20480, 16384, 12288, 8192, 4096],
+                "learned_model_options": {},
+            },
+        },
         "openai_compat": [],
     },
     "ui": {

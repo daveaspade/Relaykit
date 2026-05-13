@@ -147,6 +147,8 @@ class HermesCLIBackend:
 
         model = self._normalize_model(model)
         use_model = model.lower() not in {"auto", "default"}
+        default_model = os.environ.get("RELAYKIT_HERMES_DEFAULT_MODEL", "codex:auto")
+        chosen_model = model if use_model else default_model
         system_prompt = (system_prompt or os.environ.get("RELAYKIT_HERMES_EPHEMERAL_SYSTEM_PROMPT", "")).strip()
         api_key = (api_key or os.environ.get("RELAYKIT_HERMES_API_KEY", "")).strip()
         base_url = (base_url or os.environ.get("RELAYKIT_HERMES_BASE_URL", "") or "http://127.0.0.1:11436/v1").strip()
@@ -154,7 +156,7 @@ class HermesCLIBackend:
         library_agent_class = self._load_library_agent_class()
         if library_agent_class is not None:
             try:
-                chosen_model = model if use_model else os.environ.get("RELAYKIT_HERMES_DEFAULT_MODEL", "relaykit:codex:auto")
+                # Avoid recursive routing through RelayKit-prefixed aliases by default.
                 agent = library_agent_class(
                     model=chosen_model,
                     provider="custom",
@@ -198,8 +200,8 @@ class HermesCLIBackend:
                 cmd_env["RELAYKIT_HERMES_BASE_URL"] = base_url
         else:
             cmd_env = None
-        if use_model:
-            cmd += ["--model", model]
+        # Always pass a concrete model to avoid inheriting stale Hermes config defaults.
+        cmd += ["--model", chosen_model]
         cmd += ["-q", prompt]
 
         proc = subprocess.Popen(

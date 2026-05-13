@@ -32,6 +32,7 @@ check_cmd opencode
 check_cmd claude
 check_cmd gemini
 check_cmd codex
+check_cmd openclaw
 check_cmd hermes
 check_cmd ollama
 echo

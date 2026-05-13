@@ -53,35 +53,26 @@ class ClaudeCLIBackend:
         if not self.available:
             return []
         use_model = bool(model) and model.lower() not in {"auto", "default"}
+        # Always use non-streaming JSON mode — stream-json requires --verbose and
+        # produces noisy output that is hard to parse correctly. RelayKit's
+        # _wrap_stream wrapper presents the single response as an SSE stream anyway.
         cmd = ["claude", "-p"]
         if use_model:
             cmd += ["--model", model]
-        if stream:
-            cmd += ["--output-format", "stream-json", "--include-partial-messages"]
-        else:
-            cmd += ["--output-format", "json"]
+        cmd += ["--output-format", "json"]
         cmd.append(prompt)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if proc.stdout is None:
             return []
-        if not stream:
-            out = proc.stdout.read()
-            try:
-                obj = json.loads(out)
-                return [_extract_text(obj)]
-            except json.JSONDecodeError:
-                return [out.strip()]
-
-        def gen() -> Generator[str, None, None]:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    text = _extract_text(obj)
-                    if text:
-                        yield text
-                except json.JSONDecodeError:
-                    continue
-        return gen()
+        try:
+            out, _ = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return []
+        try:
+            obj = json.loads(out)
+            text = _extract_text(obj)
+            return [text] if text else []
+        except json.JSONDecodeError:
+            return [out.strip()] if out.strip() else []

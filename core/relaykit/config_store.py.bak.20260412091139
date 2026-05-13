@@ -1,0 +1,109 @@
+import hashlib
+import json
+import os
+import secrets
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+CONFIG_DIR = Path.home() / ".relaykit"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "providers": {
+        "claude": {"models": []},
+        "gemini": {"models": []},
+        "codex": {"models": []},
+        "hermes": {"models": []},
+        "ollama": {
+            "enabled": True,
+            "base_url": "http://localhost:11434",
+            "default_options": {},
+            "model_options": {
+                "gemma4:31b": {"num_ctx": 8192},
+                "gemma4:26b": {"num_ctx": 8192},
+            },
+            "adaptive": {
+                "enabled": True,
+                "learn": True,
+                "context_ladder": [81920, 65536, 49152, 32768, 24576, 20480, 16384, 12288, 8192, 4096],
+                "learned_model_options": {},
+            },
+        },
+        "openai_compat": [],
+    },
+    "ui": {
+        "provider_overrides": {},
+        "model_overrides": {},
+        "model_stats": {},
+        "scan_ports": [1234, 3000, 5000, 8000, 8080, 3210],
+    },
+    "aliases": {},
+    "api_keys": [],
+    "settings": {"use_settings": False},
+    "routing": {
+        "weights": {"reliability": 0.55, "latency": 0.30, "cost": 0.15},
+        "max_attempts_per_candidate": 2,
+        "retry_backoff_ms": 220,
+        "breaker_failure_threshold": 3,
+        "breaker_cooldown_seconds": 45,
+        "latency_ewma_alpha": 0.35,
+        "probe_enabled": True,
+        "probe_interval_seconds": 90,
+        "probe_model_timeout_seconds": 6,
+        "probe_mode": "light",
+    },
+}
+
+
+def _merge_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    out = json.loads(json.dumps(DEFAULT_CONFIG))
+    for k, v in cfg.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k].update(v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config() -> Dict[str, Any]:
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text())
+            return _merge_defaults(data)
+        except Exception:
+            return json.loads(json.dumps(DEFAULT_CONFIG))
+    return json.loads(json.dumps(DEFAULT_CONFIG))
+
+
+def save_config(cfg: Dict[str, Any]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def _hash_key(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def list_keys(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return cfg.get("api_keys", [])
+
+
+def verify_key(cfg: Dict[str, Any], key: str) -> Optional[str]:
+    h = _hash_key(key)
+    for item in cfg.get("api_keys", []):
+        if item.get("hash") == h:
+            return item.get("label")
+    return None
+
+
+def create_key(cfg: Dict[str, Any], label: str) -> str:
+    token = secrets.token_urlsafe(24)
+    item = {
+        "label": label,
+        "hash": _hash_key(token),
+        "created": datetime.utcnow().isoformat() + "Z",
+    }
+    cfg.setdefault("api_keys", []).append(item)
+    save_config(cfg)
+    return token

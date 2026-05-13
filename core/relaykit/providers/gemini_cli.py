@@ -52,44 +52,33 @@ class GeminiCLIBackend:
         if not self.available:
             return []
         use_model = bool(model) and model.lower() not in {"auto", "default"}
+        # Always use non-streaming JSON mode for reliable output parsing.
         cmd = ["gemini", "-p", prompt]
         if use_model:
             cmd += ["-m", model]
-        if stream:
-            cmd += ["--output-format", "stream-json"]
-        else:
-            cmd += ["--output-format", "json"]
+        cmd += ["--output-format", "json"]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if proc.stdout is None:
             return []
-        if not stream:
-            out = proc.stdout.read()
-            try:
-                obj = json.loads(out)
-                return [_extract_text(obj)]
-            except json.JSONDecodeError:
-                # Gemini CLI can emit logs before JSON; try the last JSON block.
-                idx = out.rfind("{")
-                if idx != -1:
-                    try:
-                        obj = json.loads(out[idx:])
-                        text = _extract_text(obj)
-                        if text:
-                            return [text]
-                    except json.JSONDecodeError:
-                        pass
-                return [out.strip()]
-
-        def gen() -> Generator[str, None, None]:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
+        try:
+            out, _ = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return []
+        try:
+            obj = json.loads(out)
+            text = _extract_text(obj)
+            return [text] if text else []
+        except json.JSONDecodeError:
+            # Gemini CLI can emit logs before JSON; try the last JSON block.
+            idx = out.rfind("{")
+            if idx != -1:
                 try:
-                    obj = json.loads(line)
+                    obj = json.loads(out[idx:])
                     text = _extract_text(obj)
                     if text:
-                        yield text
+                        return [text]
                 except json.JSONDecodeError:
-                    continue
-        return gen()
+                    pass
+            return [out.strip()] if out.strip() else []

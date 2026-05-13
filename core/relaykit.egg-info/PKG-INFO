@@ -38,20 +38,45 @@ If your app runs inside Docker, use:
 - OpenAI-compatible `/v1/chat/completions`
 - Streaming responses
 - Auto-detect OpenCode CLI and list models
+- Auto-detect local Ollama models (via `http://localhost:11434/api/tags`)
+- Optional: read Gemini/Claude settings if enabled
+- Native CLI adapters (no OpenCode required): Claude CLI, Gemini CLI, Codex CLI
+- Auto models for installed CLIs (`claude:auto`, `gemini:auto`, `codex:auto`)
+- OpenAI-compatible local servers (LM Studio) via `http://localhost:1234/v1`
+- API keys (local) + audit log
+- Embeddings endpoint for Ollama and OpenAI-compatible servers
 - Route by model prefix:
-  - `claude:...` -> Anthropic via OpenCode
-  - `gemini:...` -> Google via OpenCode
-  - `codex:...` or `openai:...` -> OpenAI via OpenCode
-  - `ollama:...` -> Ollama via OpenCode (if configured)
+  - `claude:...` -> Claude CLI (or OpenCode if available)
+  - `gemini:...` -> Gemini CLI (or OpenCode if available)
+  - `codex:...` -> Codex CLI (or OpenCode if available)
+  - `ollama:...` -> Ollama local API
+  - `lmstudio:...` -> LM Studio (OpenAI-compatible)
 
 ## Provider detection
 
-RelayKit detects installed CLIs and lists them in the UI. Today, OpenCode is used as the primary backend because it already supports OAuth across multiple providers.
+RelayKit detects installed CLIs and lists them in the UI. It uses multiple sources so detection works even when OpenCode is not installed:
+
+- OpenCode CLI model list (if installed)
+- Ollama local models API
+- Optional settings file support (disabled by default):
+  - `RELAYKIT_USE_SETTINGS=1`
+- Claude/Gemini/Codex CLI adapters can be forced to expose models with env vars:
+  - `RELAYKIT_CLAUDE_MODELS=claude-sonnet-4-6,claude-opus-4-6`
+  - `RELAYKIT_GEMINI_MODELS=gemini-2.5-pro,gemini-2.5-flash`
+  - `RELAYKIT_CODEX_MODELS=gpt-5.4,gpt-5.2`
+- Additional OpenAI-compatible endpoints:
+  - `RELAYKIT_COMPAT_URLS=http://127.0.0.1:8080/v1,http://host:port/v1`
+
+## Local config + API keys
+
+RelayKit stores config in `~/.relaykit/config.json` (editable from the UI). You can add model lists, aliases, and OpenAI-compatible endpoints there.
+
+If you create local API keys, RelayKit requires `Authorization: Bearer <key>` for `/v1/*` requests and writes an audit log to `~/.relaykit/audit.log`.
 
 If you want to force a specific backend later, set:
 
 ```bash
-export CLIBRIDGE_BACKEND=opencode
+export RELAYKIT_BACKEND=opencode
 ```
 
 ## Desktop UI (Tauri)

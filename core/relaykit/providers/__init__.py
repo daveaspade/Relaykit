@@ -6,5 +6,6 @@ __all__ = [
     "claude_cli",
     "gemini_cli",
     "codex_cli",
+    "openclaw_cli",
     "hermes_cli",
 ]

@@ -61,24 +61,23 @@ class CodexCLIBackend:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if proc.stdout is None:
             return []
-
-        def gen() -> Generator[str, None, None]:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    text = _extract_text(obj)
-                    if text:
-                        yield text
-                except json.JSONDecodeError:
-                    continue
-        if stream:
-            return gen()
-
-        # Collect last text chunk for non-stream
+        try:
+            out, _ = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return []
+        # Extract the last non-empty text from all JSON lines
         last = ""
-        for chunk in gen():
-            last = chunk
-        return [last]
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                text = _extract_text(obj)
+                if text:
+                    last = text
+            except json.JSONDecodeError:
+                continue
+        return [last] if last else []
